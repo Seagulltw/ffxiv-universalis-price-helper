@@ -7,6 +7,13 @@
 * 將近 7 天價格歷史寫入後台表 `趨勢圖data` 供趨勢圖使用
 
 ---
+## 範本連結（Google Sheets）
+
+- 範本（只讀）：
+  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/
+
+- 一鍵建立副本（最推薦）：
+  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/copy
 
 ## 60 秒快速開始（最懶人包）
 
