@@ -1,91 +1,69 @@
-# FFXIV Universalis 價格助手（範本）
+# FFXIV Universalis 價格助手（Google Sheets + Apps Script）
 
-這是一份 Google Sheets 範本 + 綁定（container-bound）的 Apps Script，功能包含：
+這是一份 **Google Sheets 範本**（搭配 container-bound Apps Script），用來：
+- 依 Universalis market listings 抓 **最低掛單單價**（含 HQ/NQ 規則）
+- 將指定物品的 **歷史價格（history）**寫到 `趨勢圖data`，方便直接做趨勢圖
+- 支援「勾 HQ 只更新該格單價」的輕量更新，減少卡頓與 API 呼叫
 
-* 從 Universalis 市場 **listings** 抓取「最低單價」並更新單價欄位
-* 支援 HQ 勾選邏輯（只看 HQ vs 取 min(HQ, NQ)）
-* 將近 7 天價格歷史寫入後台表 `趨勢圖data` 供趨勢圖使用
-
----
-## 範本連結（Google Sheets）
-
-- 範本（只讀）：
-  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/
-
-- 一鍵建立副本（最推薦）：
-  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/copy
-
-## 60 秒快速開始（最懶人包）
-
-1. 打開範本連結（只讀）
-2. **檔案 → 建立副本（Make a copy）**
-3. 在 **`calculator`**：
-
-   * `C1` 填 World / DC / Region（例如：`迦樓羅` 或 `陸行鳥`）
-   * （可選）`C2` 填你要做趨勢圖的目標物品名稱
-4. 確認 **`idmappingtableTW`** 對照正確：
-
-   * A 欄 = 物品名稱（繁中）
-   * B 欄 = Universalis 的 `itemId`
-5. 選單 **FFXIV**：
-
-   * `更新：單價(全表)`
-   * `更新：趨勢(7天)`（可選）
-6. （可選但建議）`安裝 onEdit 觸發器`
-
-   * 之後你只要勾 HQ，就會「只更新那一列」單價，不卡、也更省 API
+> 本專案不含任何 token / secret；請勿把私密金鑰寫進表格或程式碼。
 
 ---
 
-## 必要工作表
+## ✅ 一分鐘懶人包（End users）
 
-* `calculator`（前台 UI）
-* `idmappingtableTW`（A=物品名稱、B=itemId）
-* `趨勢圖data`（趨勢輸出）
+### 0) 先複製範本（必做）
+1. 打開範本（只讀）：**（把你的 template link 貼這裡）**
+2. Google Sheets：`File → Make a copy`
+
+### 1) 填兩個欄位
+在 `calculator`：
+- `C1`：輸入 World/DC/Region（例：`迦樓羅` 或 `陸行鳥`）
+- `C2`：輸入要畫趨勢圖的物品名稱（繁中/中文）
+
+### 2) 確認 mapping（第一次使用必看）
+在 `idmappingtableTW`：
+- A 欄：物品名稱（繁中/中文）
+- B 欄：Universalis itemId
+
+### 3) 開始使用（選單在上方：FFXIV）
+- `FFXIV → 更新：單價(全表)`
+- `FFXIV → 更新：趨勢(天數依設定)`
+
+（可選）想要「改 HQ 就自動更新單價」：
+- `FFXIV → 安裝 onEdit 觸發器(需授權)`
+- ⚠️ 觸發器不會隨 Make a copy 自動存在：每個人自己的 copy 都要自己裝一次
 
 ---
 
 ## HQ 單價規則
-
-* HQ 勾選 = **TRUE** → 使用 **HQ 最低掛單價**
-* HQ 勾選 = **FALSE** → 使用 **min(HQ 最低掛單價, NQ 最低掛單價)**
-
-> 備註：若該物品沒有 HQ 版本，HQ 最低價可能為空，腳本會依情況回退處理。
+- HQ=TRUE：使用 **HQ 最低掛單價**
+- HQ=FALSE：使用 **min(HQ 最低掛單, NQ 最低掛單)**
 
 ---
 
-## 選配設定（若你有建立/啟用）
+## 必要工作表
+- `calculator`：前台 UI
+- `idmappingtableTW`：A=名稱、B=itemId
+- `趨勢圖data`：趨勢輸出（給圖表用）
 
-* `FFXIV_Config`
-  可調整快取秒數、listings 取樣數、趨勢天數/抽樣上限、安全開關等
-* `FFXIV_Alias`
-  可自行新增 DC / WORLD_ID 對照，不用改程式碼
-
----
-
-## 常見問題排查
-
-* **抓不到單價**
-
-  * 先確認 `idmappingtableTW` A:B 名稱對得到（注意空格、全形空白、同名不同字）
-* **Make a copy 後觸發器沒作用**
-
-  * 每個副本都需要在自己的檔案內再跑一次：`FFXIV → 安裝 onEdit 觸發器`
-* **太慢 / 被限流**
-
-  * 把快取時間調長、降低 `LISTINGS_LIMIT`，或降低趨勢抽樣
+## （可選）初始化工作表
+如果你想用「不改程式碼也能調參數 / 加 world/DC 對照」：
+- `FFXIV → 初始化（建立 Config/Alias/README）`
+會建立：
+- `FFXIV_Config`：快取秒數、listings limit、趨勢天數等
+- `FFXIV_Alias`：DC / WORLD_ID 映射（繁中 → Universalis 用值）
+- `README`：表內快速說明
 
 ---
 
-## 安全與隱私
-
-* 本範本 **不包含任何 secrets**
-* 請勿在表格或程式碼中硬寫 token / key
-* 每個人 Make a copy 都是獨立副本，不會互相影響
+## 速查：為什麼抓不到價格？
+- `idmappingtableTW` 沒有對應（名稱不一致、空白、或 ID 缺）
+- `C1` world/DC 寫錯（可先用 `FFXIV → DEBUG：測 D5 抓價`）
+- Universalis 端暫時限流 / 429（稍等或調高快取秒數）
 
 ---
 
-## 資料來源與致謝
-
-* 市場掛單/成交歷史：**Universalis API**
-* 配方/物品等中繼資料可能來自使用者自行準備的本機資料庫（例如 `xiv.db`），本範本/Repo **不提供**該資料庫。詳見 `ATTRIBUTIONS.md`。
+## Credits
+- 市場資料來自 Universalis API（請尊重其使用規範與 rate limit）
+- 配方/物品資料可能來自使用者自行準備的 `xiv.db`（本 repo 不分發資料庫）
+詳見：ATTRIBUTIONS.md
