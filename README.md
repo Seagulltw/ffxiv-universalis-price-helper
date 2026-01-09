@@ -1,92 +1,62 @@
-# FFXIV Universalis Price Helper (Template)
+# FFXIV Universalis Price Helper (Google Sheets + Apps Script)
 
-A Google Sheets template + container-bound Apps Script that:
+A Google Sheets template (container-bound Apps Script) that:
+- Fetches min listing unit prices from Universalis (HQ/NQ logic)
+- Writes time-series history to `趨勢圖data` for charting
+- Supports lightweight “single-cell refresh” when toggling HQ checkboxes
 
-* Updates unit prices using Universalis market **listings** (lowest price per unit).
-* Supports HQ checkbox logic (HQ-only vs min(HQ, NQ)).
-* Writes 7-day price history into a backend sheet for charting.
-
----
-## Template (Google Sheets)
-
-- View-only template:
-  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/
-
-- Make a copy (recommended):
-  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/copy
-
-## Quick Start (60 seconds)
-
-1. Open the template link (view-only).
-2. **File → Make a copy**
-3. In sheet **`calculator`**:
-
-   * Set **`C1`** = World / DC / Region (e.g., `迦樓羅` or `陸行鳥`)
-   * (Optional) Set **`C2`** = target item name for trend chart
-4. In **`idmappingtableTW`**, confirm mapping:
-
-   * **Col A** = Item Name (ZH)
-   * **Col B** = Universalis `itemId`
-5. Menu **FFXIV**:
-
-   * **Update: Prices (Full)**
-   * **Update: Trend (7d)** (optional)
-6. (Optional but recommended) **Install onEdit trigger**
-
-   * Enables “toggle HQ checkbox → refresh only that row” to reduce lag/API calls.
+No secrets/tokens are included. Do NOT hardcode private keys into the sheet or code.
 
 ---
 
-## Required Sheets
+## 60-second Quick Start (End users)
 
-* `calculator` (front UI)
-* `idmappingtableTW` (A = item name (ZH), B = itemId)
-* `趨勢圖data` (trend output)
+### 0) Make your own copy (required)
+1. Open the template (view-only): **(paste your template link here)**
+2. Google Sheets: `File → Make a copy`
+
+### 1) Fill 2 cells
+In `calculator`:
+- `C1`: World/DC/Region (e.g., `Garuda` / `Chocobo` or localized alias like `迦樓羅` / `陸行鳥`)
+- `C2`: Target item name (for the trend chart)
+
+### 2) Check mapping (first time only)
+In `idmappingtableTW`:
+- Column A: Item name (ZH)
+- Column B: Universalis `itemId`
+
+### 3) Use the menu (FFXIV)
+- `FFXIV → Update prices (full table)`
+- `FFXIV → Update trend (days from config)`
+
+Optional (auto-refresh on HQ toggle):
+- `FFXIV → Install onEdit trigger`
+- Note: installable triggers do NOT automatically come with “Make a copy”.
+  Each user must install it in their own copy.
 
 ---
 
 ## HQ Pricing Logic
-
-* HQ checkbox = **TRUE** → use **HQ min listing**
-* HQ checkbox = **FALSE** → use **min(HQ min listing, NQ min listing)**
-
-> Note: If an item has no HQ version, HQ min may be empty. The script falls back accordingly.
+- HQ = TRUE → HQ min listing
+- HQ = FALSE → min(HQ min listing, NQ min listing)
 
 ---
 
-## Optional Config (if present)
+## Required sheets
+- `calculator`
+- `idmappingtableTW`
+- `趨勢圖data`
 
-* `FFXIV_Config`
-  Adjust cache seconds, listings limit, trend window, downsampling, safety switches.
-* `FFXIV_Alias`
-  Add DC / WORLD_ID mappings without changing code.
-
----
-
-## Troubleshooting
-
-* **No price returned**
-
-  * Check `idmappingtableTW` mapping (A name must match the name shown in `calculator`)
-  * Watch for extra spaces / full-width spaces / different ZH variants
-* **Trigger doesn’t work after copy**
-
-  * Each copy must run **FFXIV → Install onEdit trigger**
-* **Too slow / throttled**
-
-  * Increase cache seconds, reduce `LISTINGS_LIMIT`, or reduce trend sampling
+## Optional (one-click init)
+Run `FFXIV → Init (Config/Alias/README)` to create:
+- `FFXIV_Config`
+- `FFXIV_Alias`
+- `README` (in-sheet quick guide)
 
 ---
 
-## Safety / Privacy
-
-* This template contains **no secrets**.
-* Do **NOT** hardcode tokens/keys into the sheet or script.
-* Every “Make a copy” is independent and will not affect other users’ copies.
-
----
-
-## Data Credits
-
-* Market listings & sale history: **Universalis API**
-* Recipe / item metadata may come from a **user-prepared local database** (e.g., `xiv.db`) and is **not distributed** with this template. See `ATTRIBUTIONS.md`.
+## Credits
+- Market data from Universalis API (please respect their guidelines / rate limits)
+- Recipe/item metadata may come from a user-prepared local database (e.g., `xiv.db`).
+  This repository does NOT distribute `xiv.db`.
+See: ATTRIBUTIONS.md
