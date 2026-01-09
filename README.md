@@ -1,5 +1,3 @@
-Subject: TEMPLATE_README.md (English) — FFXIV Universalis Price Helper (Template)
-
 # FFXIV Universalis Price Helper (Template)
 
 A Google Sheets template + container-bound Apps Script that:
