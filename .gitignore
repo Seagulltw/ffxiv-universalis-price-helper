@@ -1,0 +1,21 @@
+
+
+# clasp auth token (never commit)
+**/.clasprc.json
+
+# local clasp project pointer (avoid committing your personal scriptId)
+**/.clasp.json
+
+# mac/windows junk
+.DS_Store
+Thumbs.db
+
+c# clasp auth token (never commit)
+**/.clasprc.json
+
+# local clasp project pointer (avoid committing your personal scriptId)
+**/.clasp.json
+
+# mac/windows junk
+.DS_Store
+Thumbs.db
