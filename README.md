@@ -7,6 +7,13 @@ A Google Sheets template + container-bound Apps Script that:
 * Writes 7-day price history into a backend sheet for charting.
 
 ---
+## Template (Google Sheets)
+
+- View-only template:
+  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/
+
+- Make a copy (recommended):
+  https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/copy
 
 ## Quick Start (60 seconds)
 
