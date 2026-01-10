@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model ItemMapping {
+  id          String   @id @default(cuid())
+  name        String
+  itemId      Int
+  locale      String   @default("zh-TW")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  recipes     Recipe[] @relation("RecipeTarget")
+
+  @@unique([name, locale])
+}
+
+model Recipe {
+  id          String       @id @default(cuid())
+  targetId    String
+  target      ItemMapping  @relation("RecipeTarget", fields: [targetId], references: [id])
+  yieldAmount Int
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  items       RecipeItem[]
+}
+
+model RecipeItem {
+  id        String  @id @default(cuid())
+  recipeId  String
+  name      String
+  quantity  Int
+  isHQ      Boolean @default(false)
+  recipe    Recipe  @relation(fields: [recipeId], references: [id])
+}
+
+model PriceTrend {
+  id         String   @id @default(cuid())
+  itemId     Int
+  world      String
+  isHQ       Boolean  @default(false)
+  unitPrice  Int
+  recordedAt DateTime @default(now())
+}

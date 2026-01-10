@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-amber-50 text-slate-900;
+}
+
+input, select {
+  @apply border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40;
+}
+
+.table-head {
+  @apply bg-blue-500 text-white text-sm font-semibold;
+}
+
+.card {
+  @apply bg-white rounded-3xl shadow-card p-6;
+}
+
+.stat {
+  @apply bg-blue-50 rounded-2xl p-4;
+}
