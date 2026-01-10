@@ -67,3 +67,31 @@
 - 市場資料來自 Universalis API（請尊重其使用規範與 rate limit）
 - 配方/物品資料可能來自使用者自行準備的 `xiv.db`（本 repo 不分發資料庫）
 詳見：ATTRIBUTIONS.md
+
+---
+
+## 雲端部署（Vercel + Supabase 免費方案）
+此專案已提供 `web/` 下的 Next.js 前端與 Prisma schema（PostgreSQL）。以下為最簡化的免費部署流程。
+
+### 1) 建立 Supabase 專案（Postgres）
+1. 建立新的 Supabase 專案，記下資料庫密碼。
+2. 在 Supabase → Project Settings → Database 複製連線字串。
+
+### 2) 建立 Vercel 專案
+1. 將此 repo 匯入 Vercel。
+2. 設定 **Root Directory** 為 `web/`（或使用 `vercel.json`）。
+3. 設定環境變數：
+   - `DATABASE_URL`（Supabase 連線字串）
+   - `NEXT_PUBLIC_UNIVERSALIS_BASE_URL`（預設 `https://universalis.app`）
+
+### 3) 初始化資料庫（一次性）
+在本機或 CI 執行：
+```bash
+cd web
+npm install
+npx prisma migrate dev --name init
+npx prisma db seed
+```
+
+### 4) 部署
+推送程式碼或手動觸發 Vercel 部署即可。

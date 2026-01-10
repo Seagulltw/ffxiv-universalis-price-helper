@@ -60,3 +60,32 @@ Run `FFXIV → Init (Config/Alias/README)` to create:
 - Recipe/item metadata may come from a user-prepared local database (e.g., `xiv.db`).
   This repository does NOT distribute `xiv.db`.
 See: ATTRIBUTIONS.md
+
+---
+
+## Cloud deployment (Vercel + Supabase, free tier)
+This repo ships a Next.js app under `web/` plus Prisma schema for PostgreSQL. The steps below
+describe a minimal free-tier deployment flow using Vercel and Supabase.
+
+### 1) Create a Supabase project (Postgres)
+1. Create a new Supabase project and note the database password.
+2. In Supabase → Project Settings → Database, copy the connection string.
+
+### 2) Prepare Vercel project
+1. Import this repo into Vercel.
+2. In the Vercel project settings, set the **Root Directory** to `web/` (or keep `vercel.json`).
+3. Add the environment variables:
+   - `DATABASE_URL` (from Supabase)
+   - `NEXT_PUBLIC_UNIVERSALIS_BASE_URL` (default: `https://universalis.app`)
+
+### 3) Run Prisma migrate + seed (once)
+From your local machine (or a CI job), run:
+```bash
+cd web
+npm install
+npx prisma migrate dev --name init
+npx prisma db seed
+```
+
+### 4) Deploy
+Trigger a Vercel deploy (push to main or manual deploy). The app will build from `web/`.
