@@ -12,7 +12,7 @@
 ## ✅ 一分鐘懶人包（End users）
 
 ### 0) 先複製範本（必做）
-1. 打開範本（只讀）：**(https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/)**
+1. 打開範本（只讀）：**(https://docs.google.com/spreadsheets/d/1DJsnLF0ntC2CGWQoHAPCVh8GexL-zcHMqdeLxJzvswI/edit?gid=1550631250#gid=1550631250)**
 2. Google Sheets：`File → Make a copy`
 
 ### 1) 填兩個欄位
