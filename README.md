@@ -12,7 +12,7 @@ No secrets/tokens are included. Do NOT hardcode private keys into the sheet or c
 ## 60-second Quick Start (End users)
 
 ### 0) Make your own copy (required)
-1. Open the template (view-only): [**(paste your template link here)**](https://docs.google.com/spreadsheets/d/14F5JXRo2ntdVOzyn7vrxh80rQrYJWqJ37GSZdX8B6Sw/)
+1. Open the template (view-only): [**(paste your template link here)**](https://docs.google.com/spreadsheets/d/1DJsnLF0ntC2CGWQoHAPCVh8GexL-zcHMqdeLxJzvswI/)
 2. Google Sheets: `File → Make a copy`
 
 ### 1) Fill 2 cells
