@@ -1,17 +1,12 @@
 /************************************************************
- * FFXIV Universalis Price Helper (Open-source friendly)
- * - Bound to Google Sheet (recommended)
- * - Safe defaults: no secrets, no external writes (except Universalis fetch)
+ * FFXIV Universalis Price Helper (Final Integrated)
  *
- * Sheets used:
- *   - calculator (front UI)
- *   - idmappingtableTW (A=name, B=itemId)
- *   - 趨勢圖data (trend output)
- *
- * Optional sheets (created by initProject):
- *   - FFXIV_Config (A=key, B=value) for overrides
- *   - FFXIV_Alias  (A=type, B=zhName, C=value) for DC/WORLD mapping
- *   - README       (in-sheet quick guide)
+ * ✅ C1/C2 變更：自動全更新（主表單價 + 攤平表單價 + 趨勢）
+ * ✅ HQ 勾選：只更新被勾到的單格（快速）
+ * ✅ C1 下拉來源=參數!E2:E，script 以 E 找 F
+ *    - F 可為 worldId(數字) 或 DC name(例如 Gaia)
+ * ✅ onEdit 偶發不觸發：加 onChange(EDIT) 保險補跑
+ * ✅ Cache key 過大：用 MD5 hash；cache.put value 過大則跳過快取
  ************************************************************/
 
 /***********************
@@ -21,24 +16,23 @@ const FRONT_SHEET_NAME = 'calculator';
 const MAP_SHEET_NAME   = 'idmappingtableTW';
 const BACK_SHEET_NAME  = '趨勢圖data';
 
-// Optional sheets
-const CONFIG_SHEET_NAME = 'FFXIV_Config';
-const ALIAS_SHEET_NAME  = 'FFXIV_Alias';
-const README_SHEET_NAME = 'README';
+// 攤平表
+const FLAT_SHEET_NAME  = '攤平全材料 - 自動導入';
 
-const WORLD_CELL  = 'C1'; // 世界/資料中心/Region
-const TARGET_CELL = 'C2'; // 目標產物（趨勢用）
+// 參數表：E=顯示名稱（C1下拉值），F=scope（worldId 或 DC 字串）
+const PARAM_SHEET_NAME = '參數';
+const PARAM_WORLD_NAME_COL = 5; // E
+const PARAM_WORLD_SCOPE_COL = 6; // F
+const PARAM_WORLD_START_ROW = 2;
+
+const WORLD_CELL  = 'C1';
+const TARGET_CELL = 'C2';
 
 const LIST_START_ROW = 5;
 const LIST_END_ROW   = 17; // 5..17 共13列
 
-// HQ / 名稱 / 數量 / 單價 / 總價（你的 layout）
-// 主：  C D E F G
-// A：  J K L M N
-// B：  Q R S Y Z
-// C：  X Y Z AA AB
-// D：  AE AF AG AH AI
-// E：  AL AM AN AO AP
+// HQ / 名稱 / 單價欄位（依你 layout）
+// 主：  C D E F G => HQ=C(3), 名稱=D(4), 單價=F(6)
 const BLOCKS = [
   { key: 'MAIN', hqCol: 3,  itemCol: 4,  priceCol: 6  },  // C D F
   { key: 'A',    hqCol: 10, itemCol: 11, priceCol: 13 }, // J K M
@@ -48,156 +42,144 @@ const BLOCKS = [
   { key: 'E',    hqCol: 38, itemCol: 39, priceCol: 41 }, // AL AM AO
 ];
 
+// 流動性星星要寫入的位置
+const LIQ_CELL = 'G2';
+
+// 星星門檻：沿用你貼的
+function liquidityStars_(v) {
+  if (v >= 17) return '⭐⭐⭐⭐⭐';
+  if (v >= 10)  return '⭐⭐⭐⭐';
+  if (v >= 5)  return '⭐⭐⭐';
+  if (v >= 1) return '⭐⭐';
+  return '⭐';
+}
+
+/**
+ * 用 history 計算「速度」(velocity)：平均每天成交筆數
+ * - 若有 HQ 成交：用 HQ count/days
+ * - 若沒有 HQ 成交（常見於無HQ物品）：用 total count/days
+ * - days 用 cfg.days（觀測窗），避免單筆且時間差很小造成暴衝
+ */
+function computeVelocityFromHistory_(hist, days) {
+  const d = Math.max(1, Number(days) || 1);
+
+  const totalCount = Array.isArray(hist) ? hist.length : 0;
+  const hqCount = Array.isArray(hist) ? hist.filter(x => !!x.hq).length : 0;
+
+  // 有 HQ 紀錄就用 HQ，不然用總成交（讓無 HQ 版本也能合理評分）
+  const usedCount = (hqCount > 0) ? hqCount : totalCount;
+  const vel = usedCount / d;
+
+  return { vel, usedCount, hqCount, totalCount, days: d };
+}
+
 /***********************
- * Default (can be overridden by FFXIV_Config)
+ * Default config
  ***********************/
 const DEFAULT_CONFIG = {
-  // Safety switch
   ALLOW_EXTERNAL_FETCH: 'TRUE',
 
-  // Cache seconds
-  CACHE_SECONDS_MARKET: '5',   // market(listings)
-  CACHE_SECONDS_HIS:    '15',  // history
+  CACHE_SECONDS_MARKET: '6',    // market compact cache
+  CACHE_SECONDS_HIS_FB: '10',   // history fallback compact cache
+  CACHE_SECONDS_HIS:    '15',   // trend history
 
-  // listings limit
   LISTINGS_LIMIT: '50',
 
-  // Trend controls
+  // batching（太大容易 504；太小則慢）
+  MARKET_BATCH_SIZE: '40',      // 建議 30~60
+  HISTORY_BATCH_SIZE: '80',     // up to 100
+  REQUEST_PAUSE_MS:  '60',
+
+  // retry
+  RETRY_MAX_ATTEMPTS: '4',
+  RETRY_BASE_MS:      '300',
+
+  // history fallback window
+  HISTORY_FALLBACK_HOURS: '72',
+
+  // trend
   DAYS: '7',
   MAX_TREND_ROWS_TOTAL: '2500',
   MAX_TREND_PER_DAY: '250',
 };
 
-// Fallback aliases (can be overridden/extended by FFXIV_Alias)
-const DEFAULT_DC_ALIAS = {
-  '陸行鳥': 'Chocobo',
-};
-
-const DEFAULT_WORLD_ID_ALIAS = {
-  '伊弗利特': 4028,
-  '迦樓羅':   4029,
-  '利維坦':   4030,
-  '鳳凰':     4031,
-  '奧汀':     4032,
-  '巴哈姆特': 4033,
-  '拉姆':     4034,
-  '泰坦':     4035,
-};
-
 /***********************
- * UI：選單 + 安裝型觸發器
+ * Menu
  ***********************/
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('FFXIV')
-    .addItem('初始化（建立 Config/Alias/README）', 'initProject')
-    .addSeparator()
-    .addItem('更新：單價(全表)', 'updatePricesNow')
+    .addItem('更新：單價(全表+攤平)', 'updatePricesNow')
     .addItem('更新：趨勢(天數依設定)', 'updateTrendNow')
     .addSeparator()
-    .addItem('安裝 onEdit 觸發器(需授權)', 'setupTriggers')
-    .addItem('移除 onEdit 觸發器', 'removeTriggers')
-    .addSeparator()
-    .addItem('模板發布前整理（移除trigger/清單價）', 'prepareForTemplate')
-    .addSeparator()
-    .addItem('DEBUG：測 D5 抓價(用 market listings)', 'debugOneRowD5')
+    .addItem('安裝 triggers（onEdit+onChange保險）', 'setupTriggers')
+    .addItem('移除 triggers', 'removeTriggers')
+    .addItem('診斷：trigger狀態/最後觸發', 'diagnoseTriggers')
     .addToUi();
 }
 
+/***********************
+ * Trigger install/remove/diagnose
+ ***********************/
 function setupTriggers() {
   removeTriggers();
+
+  const ss = SpreadsheetApp.getActive();
+
   ScriptApp.newTrigger('onEditInstalled')
-    .forSpreadsheet(SpreadsheetApp.getActive())
+    .forSpreadsheet(ss)
     .onEdit()
     .create();
-  SpreadsheetApp.getActive().toast('Installed onEditInstalled trigger', 'FFXIV', 5);
+
+  // 保險：有時 onEdit 偶發沒觸發，onChange(EDIT) 仍會觸發
+  ScriptApp.newTrigger('onChangeInstalled')
+    .forSpreadsheet(ss)
+    .onChange()
+    .create();
+
+  PropertiesService.getDocumentProperties().setProperty('TRIGGER_INSTALLED_AT', new Date().toISOString());
+  SpreadsheetApp.getActive().toast('Triggers installed ✅ (onEdit + onChange)', 'FFXIV', 6);
 }
 
 function removeTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   for (const t of triggers) {
-    if (t.getHandlerFunction() === 'onEditInstalled') ScriptApp.deleteTrigger(t);
+    const fn = t.getHandlerFunction();
+    if (fn === 'onEditInstalled' || fn === 'onChangeInstalled') ScriptApp.deleteTrigger(t);
   }
 }
 
-/***********************
- * One-click init: create optional Config/Alias/README sheets
- ***********************/
-function initProject() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function diagnoseTriggers() {
+  const ts = ScriptApp.getProjectTriggers()
+    .filter(t => ['onEditInstalled', 'onChangeInstalled'].includes(t.getHandlerFunction()))
+    .map(t => `${t.getHandlerFunction()} / ${t.getEventType()}`);
 
-  // Config
-  let cfgSh = ss.getSheetByName(CONFIG_SHEET_NAME);
-  if (!cfgSh) cfgSh = ss.insertSheet(CONFIG_SHEET_NAME);
-  cfgSh.clearContents();
-  cfgSh.getRange(1, 1, 1, 2).setValues([['Key', 'Value']]);
+  const props = PropertiesService.getDocumentProperties();
+  const lastEdit = props.getProperty('LAST_ONEDIT_AT') || '(none)';
+  const lastChg  = props.getProperty('LAST_ONCHANGE_AT') || '(none)';
+  const lastFull = props.getProperty('LAST_FULLRUN_AT') || '(none)';
 
-  const cfgRows = Object.keys(DEFAULT_CONFIG).map(k => [k, DEFAULT_CONFIG[k]]);
-  cfgSh.getRange(2, 1, cfgRows.length, 2).setValues(cfgRows);
-  cfgSh.autoResizeColumns(1, 2);
-
-  // Alias
-  let aliasSh = ss.getSheetByName(ALIAS_SHEET_NAME);
-  if (!aliasSh) aliasSh = ss.insertSheet(ALIAS_SHEET_NAME);
-  aliasSh.clearContents();
-  aliasSh.getRange(1, 1, 1, 3).setValues([['Type', 'Name(ZH)', 'Value']]);
-  aliasSh.getRange(2, 1, 1, 3).setValues([['DC', '陸行鳥', 'Chocobo']]);
-  aliasSh.getRange(3, 1, 1, 3).setValues([['WORLD_ID', '迦樓羅', '4029']]);
-  aliasSh.getRange(5, 1, 1, 3).setValues([['(Notes)', 'Type=DC or WORLD_ID', 'Value: DC English name or worldId number']]);
-  aliasSh.autoResizeColumns(1, 3);
-
-  // README sheet (quick guide)
-  let readmeSh = ss.getSheetByName(README_SHEET_NAME);
-  if (!readmeSh) readmeSh = ss.insertSheet(README_SHEET_NAME);
-  readmeSh.clearContents();
-
-  const lines = [
-    'FFXIV Universalis Price Helper (Template)',
-    '',
-    'Quick start:',
-    '1) Fill C1 (World/DC/Region) in "calculator". Example: 迦樓羅 or 陸行鳥',
-    '2) Ensure idmappingtableTW: Col A = Item Name (ZH), Col B = ItemId',
-    '3) Menu: FFXIV -> Install onEdit trigger (optional)',
-    '4) Use: FFXIV -> Update prices / Update trend',
-    '',
-    'Optional:',
-    '- Edit FFXIV_Config to change cache/listings/trend settings',
-    '- Edit FFXIV_Alias to add DC/WORLD_ID mappings without changing code',
-    '',
-    'Safety:',
-    '- No secrets are stored in this template. Do not hardcode tokens/keys.',
-  ];
-  readmeSh.getRange(1, 1, lines.length, 1).setValues(lines.map(x => [x]));
-  readmeSh.autoResizeColumn(1);
-
-  SpreadsheetApp.getActive().toast('Initialized Config/Alias/README', 'FFXIV', 6);
+  SpreadsheetApp.getActive().toast(
+    `Triggers: ${ts.length ? ts.join(', ') : 'NOT FOUND'} | onEdit=${lastEdit} | onChange=${lastChg} | fullRun=${lastFull}`,
+    'FFXIV',
+    10
+  );
 }
 
 /***********************
- * Template prep: remove triggers + clear unit price columns + reset HQ defaults
- ***********************/
-function prepareForTemplate() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  removeTriggers();
-
-  const front = ss.getSheetByName(FRONT_SHEET_NAME);
-  if (front) {
-    resetHQDefaults_(front);
-  }
-
-  SpreadsheetApp.getActive().toast('Template prepared (triggers removed, prices cleared)', 'FFXIV', 6);
-}
-
-/***********************
- * onEdit：
- * - 世界/目標改變 → resetHQ（只保留 C5=TRUE）→ flush 等公式 → 全表更新 → 趨勢
- * - 只改 HQ 勾選 → 只更新該格單價（不全表）
+ * Installed triggers
  ***********************/
 function onEditInstalled(e) {
+  const lock = LockService.getDocumentLock();
   try {
-    if (!e || !e.range) return;
+    if (!e || !e.range || !e.source) return;
+    PropertiesService.getDocumentProperties().setProperty('LAST_ONEDIT_AT', new Date().toISOString());
+
     const sh = e.range.getSheet();
-    if (sh.getName() !== FRONT_SHEET_NAME) return;
+    if (!sh || sh.getName() !== FRONT_SHEET_NAME) return;
+
+    // ✅ 不要 tryLock 丟事件；改 waitLock
+    lock.waitLock(20000);
 
     const ss = e.source;
     const front = ss.getSheetByName(FRONT_SHEET_NAME);
@@ -211,99 +193,131 @@ function onEditInstalled(e) {
     const touchedWorld  = rangeIntersectsA1_(front, r1, r2, c1, c2, WORLD_CELL);
     const touchedTarget = rangeIntersectsA1_(front, r1, r2, c1, c2, TARGET_CELL);
 
-    const lock = LockService.getDocumentLock();
-    if (!lock.tryLock(10000)) return;
-
     if (touchedWorld || touchedTarget) {
-      resetHQDefaults_(front);
-
-      // 等公式把名稱/數量等算出來
-      SpreadsheetApp.flush();
-      Utilities.sleep(400);
-      SpreadsheetApp.flush();
-
-      updateAllPrices_(ss);
-      updateTrendData_(ss);
-
-      lock.releaseLock();
+      runFullRefresh_(ss, 'onEdit:C1/C2');
       return;
     }
 
-    // 只改 HQ → 單格更新
+    // HQ checkbox edits => fast path
     const targets = detectHQEdits_(r1, r2, c1, c2);
-    if (targets.length === 0) { lock.releaseLock(); return; }
-
-    // 節流：避免連續點擊造成頻繁打 API
-    const props = PropertiesService.getDocumentProperties();
-    const now = Date.now();
-    const last = Number(props.getProperty('LAST_RUN_MS') || '0');
-    if (now - last < 250) { lock.releaseLock(); return; }
-    props.setProperty('LAST_RUN_MS', String(now));
+    if (targets.length === 0) return;
 
     updateSinglePrices_(ss, targets);
-    lock.releaseLock();
   } catch (err) {
     Logger.log('[onEditInstalled] %s', err && err.stack ? err.stack : err);
-    try {
-      SpreadsheetApp.getActive().toast(
-        'FFXIV script error: ' + (err && err.message ? err.message : String(err)),
-        'FFXIV',
-        6
-      );
-    } catch (_) {}
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
   }
 }
 
+// 保險：若 onEdit 偶發沒跑，onChange(EDIT) 仍可抓到 C1/C2 變更
+function onChangeInstalled(e) {
+  const lock = LockService.getDocumentLock();
+  try {
+    PropertiesService.getDocumentProperties().setProperty('LAST_ONCHANGE_AT', new Date().toISOString());
+
+    // 只處理 EDIT 類型（避免插入列/刪欄造成亂跑）
+    if (e && e.changeType && String(e.changeType).toUpperCase() !== 'EDIT') return;
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const front = ss.getSheetByName(FRONT_SHEET_NAME);
+    if (!front) return;
+
+    const props = PropertiesService.getDocumentProperties();
+    const now = Date.now();
+    const lastFullMs = Number(props.getProperty('LAST_FULLRUN_MS') || '0');
+    if (now - lastFullMs < 1200) return; // 避免 onEdit 已經跑完又被 onChange 重複跑
+
+    const rawC1 = String(front.getRange(WORLD_CELL).getDisplayValue() || '').trim();
+    const rawC2 = String(front.getRange(TARGET_CELL).getDisplayValue() || '').trim();
+
+    const lastC1 = props.getProperty('LAST_SEEN_C1') || '';
+    const lastC2 = props.getProperty('LAST_SEEN_C2') || '';
+
+    // 若 C1/C2 沒變，就不做事（避免 onChange 太吵）
+    if (rawC1 === lastC1 && rawC2 === lastC2) return;
+
+    lock.waitLock(20000);
+    runFullRefresh_(ss, 'onChange:guard');
+  } catch (err) {
+    Logger.log('[onChangeInstalled] %s', err && err.stack ? err.stack : err);
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+
 /***********************
- * 手動按鈕
+ * Manual actions
  ***********************/
 function updatePricesNow() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  SpreadsheetApp.getActive().toast('Updating prices...', 'FFXIV', 3);
-  updateAllPrices_(ss);
-  SpreadsheetApp.getActive().toast('Done', 'FFXIV', 2);
+  const front = ss.getSheetByName(FRONT_SHEET_NAME);
+  if (front) waitForStableFrontList_(front, { maxMs: 7000, stableHitsNeeded: 2, sleepMs: 250 });
+  runFullRefresh_(ss, 'manual:updatePricesNow');
 }
 
 function updateTrendNow() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  SpreadsheetApp.getActive().toast('Updating trend...', 'FFXIV', 3);
   updateTrendData_(ss);
-  SpreadsheetApp.getActive().toast('Done', 'FFXIV', 2);
 }
 
 /***********************
- * Config helpers (DocumentProperties > Config sheet > defaults)
+ * Full refresh pipeline (C1/C2 change)
+ * - reset HQ defaults (only keep C5=TRUE)
+ * - wait formulas ready
+ * - update main prices
+ * - update flat prices (same run)
+ * - update trend
+ ***********************/
+function runFullRefresh_(ss, reason) {
+  const props = PropertiesService.getDocumentProperties();
+  props.setProperty('LAST_FULLRUN_AT', new Date().toISOString());
+  props.setProperty('LAST_FULLRUN_REASON', String(reason || ''));
+  props.setProperty('LAST_FULLRUN_MS', String(Date.now()));
+
+  const front = ss.getSheetByName(FRONT_SHEET_NAME);
+  if (front) {
+    // 記住最新 C1/C2（給 onChange guard）
+    props.setProperty('LAST_SEEN_C1', String(front.getRange(WORLD_CELL).getDisplayValue() || '').trim());
+    props.setProperty('LAST_SEEN_C2', String(front.getRange(TARGET_CELL).getDisplayValue() || '').trim());
+
+    resetHQDefaults_(front, { clearPrices: false });
+    SpreadsheetApp.flush();
+
+    // ✅ 改成等整段清單穩定（避免價格錯位）
+    waitForStableFrontList_(front, { maxMs: 7000, stableHitsNeeded: 2, sleepMs: 250 });
+
+    // 再 flush 一次，確保最後狀態
+    SpreadsheetApp.flush();
+  }
+
+  updateAllPrices_(ss);
+  updateFlatRecipePrices_(ss);
+  updateTrendData_(ss);
+}
+
+/***********************
+ * Config
  ***********************/
 function getConfig_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getDocumentProperties();
-
-  // from sheet (optional)
-  const sheetMap = {};
-  const sh = ss.getSheetByName(CONFIG_SHEET_NAME);
-  if (sh && sh.getLastRow() >= 2) {
-    const vals = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getDisplayValues();
-    for (const [k, v] of vals) {
-      const kk = String(k || '').trim();
-      if (!kk) continue;
-      sheetMap[kk] = String(v || '').trim();
-    }
-  }
-
-  // merge
   const out = {};
   for (const k of Object.keys(DEFAULT_CONFIG)) {
-    out[k] =
-      (props.getProperty(k) != null ? props.getProperty(k) :
-       (sheetMap[k] != null ? sheetMap[k] : DEFAULT_CONFIG[k]));
+    out[k] = (props.getProperty(k) != null) ? props.getProperty(k) : DEFAULT_CONFIG[k];
   }
-
-  // typed getters
   return {
     allowExternalFetch: String(out.ALLOW_EXTERNAL_FETCH).toUpperCase() === 'TRUE',
-    cacheMarket: toInt_(out.CACHE_SECONDS_MARKET, 5),
+    cacheMarket: toInt_(out.CACHE_SECONDS_MARKET, 6),
+    cacheHisFb: toInt_(out.CACHE_SECONDS_HIS_FB, 10),
     cacheHis: toInt_(out.CACHE_SECONDS_HIS, 15),
     listingsLimit: toInt_(out.LISTINGS_LIMIT, 50),
+    marketBatchSize: toInt_(out.MARKET_BATCH_SIZE, 40),
+    historyBatchSize: Math.min(100, toInt_(out.HISTORY_BATCH_SIZE, 80)),
+    requestPauseMs: toInt_(out.REQUEST_PAUSE_MS, 60),
+    retryMaxAttempts: toInt_(out.RETRY_MAX_ATTEMPTS, 4),
+    retryBaseMs: toInt_(out.RETRY_BASE_MS, 300),
+    historyFallbackHours: toInt_(out.HISTORY_FALLBACK_HOURS, 72),
     days: toInt_(out.DAYS, 7),
     maxTrendRowsTotal: toInt_(out.MAX_TREND_ROWS_TOTAL, 2500),
     maxTrendPerDay: toInt_(out.MAX_TREND_PER_DAY, 250),
@@ -316,47 +330,89 @@ function toInt_(v, fallback) {
 }
 
 /***********************
- * Alias loaders (defaults + optional ALIAS sheet)
+ * 參數!E:F mapping（E=dropdown name, F=scope worldId/DC）
  ***********************/
-function loadAliases_() {
+function loadScopeMapFromParams_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const dc = Object.assign({}, DEFAULT_DC_ALIAS);
-  const world = Object.assign({}, DEFAULT_WORLD_ID_ALIAS);
+  const sh = ss.getSheetByName(PARAM_SHEET_NAME);
+  if (!sh) return {};
 
-  const sh = ss.getSheetByName(ALIAS_SHEET_NAME);
-  if (!sh || sh.getLastRow() < 2) return { dc, world };
+  const last = sh.getLastRow();
+  if (last < PARAM_WORLD_START_ROW) return {};
 
-  const vals = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getDisplayValues();
-  for (const [typeRaw, nameRaw, valRaw] of vals) {
-    const type = String(typeRaw || '').trim().toUpperCase();
-    const name = String(nameRaw || '').trim();
-    const val  = String(valRaw || '').trim();
-    if (!type || !name || !val) continue;
+  const vals = sh.getRange(
+    PARAM_WORLD_START_ROW,
+    PARAM_WORLD_NAME_COL,
+    last - PARAM_WORLD_START_ROW + 1,
+    2
+  ).getDisplayValues();
 
-    if (type === 'DC') dc[name] = val;
-    if (type === 'WORLD_ID') world[name] = Number(val);
+  const map = {};
+  for (const [name, scope] of vals) {
+    const n = String(name || '').trim();
+    const s = String(scope || '').trim();
+    if (n && s && map[n] == null) map[n] = s;
   }
-  return { dc, world };
+  return map;
+}
+function snapshotFrontItemNames_(front) {
+  const rowCount = LIST_END_ROW - LIST_START_ROW + 1;
+  const parts = [];
+  for (const b of BLOCKS) {
+    const v = front.getRange(LIST_START_ROW, b.itemCol, rowCount, 1).getDisplayValues();
+    // 用 \u0001 分隔避免碰到正常字元
+    parts.push(v.map(r => String(r[0] || '').trim()).join('\u0001'));
+  }
+  return parts.join('\u0002'); // block 分隔
+}
+
+/**
+ * 等待清單穩定：同一份快照連續一致 N 次才放行
+ */
+function waitForStableFrontList_(front, opts) {
+  const maxMs = (opts && opts.maxMs) || 6000;
+  const stableHitsNeeded = (opts && opts.stableHitsNeeded) || 2; // 連續一致 2 次
+  const sleepMs = (opts && opts.sleepMs) || 250;
+
+  const start = Date.now();
+  let last = '';
+  let hits = 0;
+
+  while (Date.now() - start < maxMs) {
+    SpreadsheetApp.flush();
+    const snap = snapshotFrontItemNames_(front);
+
+    // 空白快照通常代表還在算，不算穩定
+    const hasAny = snap.replace(/\u0001|\u0002/g, '').trim().length > 0;
+
+    if (hasAny && snap === last) {
+      hits++;
+      if (hits >= stableHitsNeeded) return true;
+    } else {
+      hits = 0;
+      last = snap;
+    }
+    Utilities.sleep(sleepMs);
+  }
+  return false; // 超時也不要卡死，後面仍會跑，只是比較可能寫錯位
 }
 
 function normalizeScope_(scopeRaw) {
   const s = String(scopeRaw || '').trim();
   if (!s) return '';
 
-  const { dc, world } = loadAliases_();
+  // ✅ 先用 參數!E:F 映射：E(下拉文字) -> F(scope)
+  const m = loadScopeMapFromParams_();
+  if (m[s]) return String(m[s]).trim(); // F 可以是 worldId 或 Gaia
 
-  if (dc[s]) return dc[s];                    // DC
-  if (world[s]) return String(world[s]);      // worldId
-  if (/^\d+$/.test(s)) return s;              // already worldId
-  return s;                                   // allow user input english world/dc/region
+  // 如果你直接在 C1 輸入 worldId / Gaia 也放行
+  return s;
 }
 
 /***********************
- * reset HQ：清所有 HQ，只保留 C5 = TRUE
- * ✅ 不清 物品名稱/數量/總價（那些是公式）
- * ✅ 只清單價欄，避免殘留
+ * reset HQ + clear prices
  ***********************/
-function resetHQDefaults_(front) {
+function resetHQDefaults_(front, opt) {
   const rows = LIST_END_ROW - LIST_START_ROW + 1;
   for (const b of BLOCKS) {
     front.getRange(LIST_START_ROW, b.hqCol, rows, 1).setValues(
@@ -364,20 +420,61 @@ function resetHQDefaults_(front) {
     );
   }
   front.getRange(LIST_START_ROW, BLOCKS[0].hqCol).setValue(true); // only keep C5
-  clearPriceCols_(front);
+
+  // ✅ 只有在 template cleanup 才清單價；平常更新不清，避免閃爍
+  if (opt && opt.clearPrices) clearPriceCols_(front);
 }
 
-function clearPriceCols_(front) {
-  const rows = LIST_END_ROW - LIST_START_ROW + 1;
-  for (const b of BLOCKS) {
-    front.getRange(LIST_START_ROW, b.priceCol, rows, 1).clearContent();
+
+/***********************
+ * mapping table A=名稱, B=ID
+ ***********************/
+function buildNameToIdMap_(mapSh) {
+  const last = mapSh.getLastRow();
+  if (last < 1) return {};
+  const vals = mapSh.getRange(1, 1, last, 2).getDisplayValues();
+  const map = {};
+  for (const [name, id] of vals) {
+    const n = normalizeName_(name);
+    const i = String(id || '').trim();
+    if (n && i && map[n] == null) map[n] = i;
   }
+  return map;
+}
+
+function normalizeName_(s) {
+  return String(s || '')
+    .replace(/\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /***********************
- * 價格策略
- * True  → HQ minListing
- * False → min(HQ minListing, NQ minListing)
+ * HQ checkbox edit detect
+ ***********************/
+function detectHQEdits_(r1, r2, c1, c2) {
+  const out = [];
+  const rowLo = Math.max(LIST_START_ROW, r1);
+  const rowHi = Math.min(LIST_END_ROW, r2);
+  if (rowLo > rowHi) return out;
+
+  for (let bi = 0; bi < BLOCKS.length; bi++) {
+    const hqCol = BLOCKS[bi].hqCol;
+    if (hqCol < c1 || hqCol > c2) continue;
+    for (let r = rowLo; r <= rowHi; r++) out.push({ row: r, blockIndex: bi });
+  }
+  return out;
+}
+
+function rangeIntersectsA1_(sheet, r1, r2, c1, c2, a1) {
+  const rg = sheet.getRange(a1);
+  const rr = rg.getRow();
+  const cc = rg.getColumn();
+  return (rr >= r1 && rr <= r2 && cc >= c1 && cc <= c2);
+}
+
+/***********************
+ * Price strategy
  ***********************/
 function computePriceByHQ_(obj, isHQ) {
   const h = (obj?.hqMin == null ? null : Number(obj.hqMin));
@@ -393,8 +490,24 @@ function computePriceByHQ_(obj, isHQ) {
   return Math.min(h, n);
 }
 
+function computePriceFromHistoryByHQ_(obj, isHQ) {
+  const h = (obj?.hqLast == null ? null : Number(obj.hqLast));
+  const n = (obj?.nqLast == null ? null : Number(obj.nqLast));
+  const okH = (h != null && isFinite(h));
+  const okN = (n != null && isFinite(n));
+
+  if (isHQ) return okH ? h : null;
+
+  if (!okH && !okN) return null;
+  if (okH && !okN) return h;
+  if (!okH && okN) return n;
+  return Math.min(h, n);
+}
+
 /***********************
- * 全表更新：用 market(listings) 批次抓最低掛單
+ * Update all prices (main calculator blocks)
+ * - market first
+ * - fallback history latest sale (if market missing/null)
  ***********************/
 function updateAllPrices_(ss) {
   const cfg = getConfig_();
@@ -429,37 +542,88 @@ function updateAllPrices_(ss) {
   }
 
   const ids = Array.from(idSet);
-  if (ids.length === 0) {
-    SpreadsheetApp.getActive().toast('No IDs to query. Check idmappingtableTW A:B mapping.', 'FFXIV', 6);
-    return;
-  }
+  if (ids.length === 0) return;
 
   const marketById = fetchMinListingsFromMarket_(scope, ids, cfg);
+
+  const perBlockMeta = [];
+  const needHistoryIdSet = new Set();
 
   for (let bi = 0; bi < BLOCKS.length; bi++) {
     const b = BLOCKS[bi];
     const names = blockNames[bi];
     const hqs = blockHQs[bi];
 
-    const out = [];
-    for (let i = 0; i < names.length; i++) {
+    const oldPrices = front.getRange(LIST_START_ROW, b.priceCol, rowCount, 1).getValues();
+
+    const metaRows = [];
+    const outVals = [];
+
+    for (let i = 0; i < rowCount; i++) {
       const name = names[i];
-      if (!name) { out.push(['']); continue; }
+      const isHQ = !!hqs[i];
+
+      if (!name) { metaRows.push({ id:'', isHQ, needHistory:false }); outVals.push(['']); continue; }
 
       const id = String(nameToId[name] || '').trim();
-      if (!id) { out.push(['']); continue; }
+      if (!id) { metaRows.push({ id:'', isHQ, needHistory:false }); outVals.push(['']); continue; }
 
-      const obj = marketById[id] || {};
-      const price = computePriceByHQ_(obj, hqs[i]);
-      out.push([price == null ? '' : Math.ceil(price)]);
+      const hasMarket = Object.prototype.hasOwnProperty.call(marketById, id);
+      if (!hasMarket) {
+        metaRows.push({ id, isHQ, needHistory:true });
+        needHistoryIdSet.add(id);
+        outVals.push([oldPrices[i][0]]);
+        continue;
+      }
+
+      const price = computePriceByHQ_(marketById[id] || {}, isHQ);
+      if (price == null) {
+        metaRows.push({ id, isHQ, needHistory:true });
+        needHistoryIdSet.add(id);
+        outVals.push([oldPrices[i][0]]);
+      } else {
+        metaRows.push({ id, isHQ, needHistory:false });
+        outVals.push([Math.ceil(price)]);
+      }
     }
 
-    front.getRange(LIST_START_ROW, b.priceCol, rowCount, 1).setValues(out);
+    perBlockMeta.push({ b, oldPrices, metaRows, outVals });
+  }
+
+  let hisById = {};
+  const needHistoryIds = Array.from(needHistoryIdSet);
+  if (needHistoryIds.length) {
+    hisById = fetchLastSoldFromHistory_(scope, needHistoryIds, cfg);
+  }
+
+  for (const pack of perBlockMeta) {
+    const { b, oldPrices, metaRows, outVals } = pack;
+
+    for (let i = 0; i < outVals.length; i++) {
+      const m = metaRows[i];
+      if (!m.needHistory) continue;
+
+      const id = m.id;
+      if (!id) continue;
+
+      if (Object.prototype.hasOwnProperty.call(hisById, id)) {
+        const p = computePriceFromHistoryByHQ_(hisById[id] || {}, m.isHQ);
+        if (p != null) outVals[i][0] = Math.ceil(p);
+        else outVals[i][0] = oldPrices[i][0];
+      } else {
+        outVals[i][0] = oldPrices[i][0];
+      }
+    }
+
+    front.getRange(LIST_START_ROW, b.priceCol, rowCount, 1).setValues(outVals);
   }
 }
 
+
+
+
 /***********************
- * 只更新被改到 HQ 勾選的那幾列（單格更新）
+ * Update single prices (HQ checkbox)
  ***********************/
 function updateSinglePrices_(ss, targets) {
   const cfg = getConfig_();
@@ -489,99 +653,299 @@ function updateSinglePrices_(ss, targets) {
   }
 
   const ids = Array.from(idSet);
-  if (ids.length === 0) return;
+  if (!ids.length) return;
 
   const marketById = fetchMinListingsFromMarket_(scope, ids, cfg);
 
+  const needHis = new Set();
   for (const x of need) {
-    const obj = marketById[x.id] || {};
-    const price = computePriceByHQ_(obj, x.isHQ);
-    front.getRange(x.row, x.b.priceCol).setValue(price == null ? '' : Math.ceil(price));
+    const hasMarket = Object.prototype.hasOwnProperty.call(marketById, x.id);
+    if (!hasMarket) { needHis.add(x.id); continue; }
+    const p = computePriceByHQ_(marketById[x.id] || {}, x.isHQ);
+    if (p == null) needHis.add(x.id);
+  }
+
+  const hisById = needHis.size ? fetchLastSoldFromHistory_(scope, Array.from(needHis), cfg) : {};
+
+  for (const x of need) {
+    const oldVal = front.getRange(x.row, x.b.priceCol).getValue();
+
+    if (Object.prototype.hasOwnProperty.call(marketById, x.id)) {
+      const pMarket = computePriceByHQ_(marketById[x.id] || {}, x.isHQ);
+      if (pMarket != null) {
+        front.getRange(x.row, x.b.priceCol).setValue(Math.ceil(pMarket));
+        continue;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(hisById, x.id)) {
+      const pHis = computePriceFromHistoryByHQ_(hisById[x.id] || {}, x.isHQ);
+      if (pHis != null) front.getRange(x.row, x.b.priceCol).setValue(Math.ceil(pHis));
+      else front.getRange(x.row, x.b.priceCol).setValue(oldVal);
+    } else {
+      front.getRange(x.row, x.b.priceCol).setValue(oldVal);
+    }
   }
 }
 
 /***********************
- * market(listings)：批次抓最低掛單
- * - from listings to match UI
- * - cache per URL
+ * 攤平表：單價跟主功能同時更新
+ * 讀 A:G 表頭自動找 HQ/物品名稱/單價，找不到則 fallback A/B/D
+ ***********************/
+// ✅ 你攤平表 sheet 名稱（請確認完全一致）
+
+// 攤平表固定 layout（跟 calculator 一樣：HQ=C, 名稱=D, 單價=F）
+const FLAT_LIST_START_ROW = 5;  // 想只抓材料就改 6
+const FLAT_LIST_END_ROW   = 17;
+const FLAT_HQ_COL   = 3;  // C
+const FLAT_ITEM_COL = 4;  // D
+const FLAT_PRICE_COL= 6;  // F
+
+function updateFlatRecipePrices_(ss) {
+  const cfg = getConfig_();
+
+  const front = ss.getSheetByName(FRONT_SHEET_NAME);
+  const mapSh = ss.getSheetByName(MAP_SHEET_NAME);
+  const flat  = ss.getSheetByName(FLAT_SHEET_NAME);
+  if (!front || !mapSh || !flat) return;
+
+  const scope = normalizeScope_(front.getRange(WORLD_CELL).getDisplayValue());
+  if (!scope) return;
+
+  const nameToId = buildNameToIdMap_(mapSh);
+
+  const rowCount = FLAT_LIST_END_ROW - FLAT_LIST_START_ROW + 1;
+  const names = flat.getRange(FLAT_LIST_START_ROW, FLAT_ITEM_COL, rowCount, 1)
+    .getDisplayValues().map(r => normalizeName_(r[0]));
+  const hqs = flat.getRange(FLAT_LIST_START_ROW, FLAT_HQ_COL, rowCount, 1)
+    .getValues().map(r => !!r[0]);
+
+  const rowMeta = new Array(rowCount);
+  const idSet = new Set();
+
+  for (let i = 0; i < rowCount; i++) {
+    const n = names[i];
+    if (!n) { rowMeta[i] = { id: '', isHQ: hqs[i] }; continue; }
+    const id = String(nameToId[n] || '').trim();
+    rowMeta[i] = { id, isHQ: hqs[i] };
+    if (id) idSet.add(id);
+  }
+
+  const ids = Array.from(idSet);
+  if (!ids.length) return;
+
+  const marketById = fetchMinListingsFromMarket_(scope, ids, cfg);
+
+  // ✅ 不保留舊值：抓不到就改抓 history，再不行就空白（避免看起來像照搬）
+  const out = Array.from({ length: rowCount }, () => ['']);
+  const needHistory = new Set();
+
+  for (let i = 0; i < rowCount; i++) {
+    const { id, isHQ } = rowMeta[i];
+    if (!id) continue;
+
+    const m = marketById[id];
+    const p = computePriceByHQ_(m || {}, isHQ);
+    if (p == null) needHistory.add(id);
+    else out[i][0] = Math.ceil(p);
+  }
+
+  if (needHistory.size) {
+    const hisById = fetchLastSoldFromHistory_(scope, Array.from(needHistory), cfg);
+    for (let i = 0; i < rowCount; i++) {
+      const { id, isHQ } = rowMeta[i];
+      if (!id || !needHistory.has(id)) continue;
+      const p2 = computePriceFromHistoryByHQ_(hisById[id] || {}, isHQ);
+      if (p2 != null) out[i][0] = Math.ceil(p2);
+    }
+  }
+
+  flat.getRange(FLAT_LIST_START_ROW, FLAT_PRICE_COL, rowCount, 1).setValues(out);
+}
+
+
+/***********************
+ * market(listings) batch + compact cache
  ***********************/
 function fetchMinListingsFromMarket_(scope, ids, cfg) {
-  const out = {}; // id -> { hqMin, nqMin }
-  const cache = CacheService.getDocumentCache();
-
+  const out = {};
   if (!cfg.allowExternalFetch) return out;
 
-  const reqs = [];
-  const meta = [];
+  const cache = CacheService.getDocumentCache();
+  const chunks = chunkArray_(ids, Math.max(1, cfg.marketBatchSize));
 
-  for (const id of ids) {
+  for (const batch of chunks) {
     const url =
       "https://universalis.app/api/v2/" +
       encodeURIComponent(scope) + "/" +
-      encodeURIComponent(id) +
+      batch.map(x => encodeURIComponent(String(x))).join(",") +
       "?listings=" + cfg.listingsLimit +
       "&entries=0";
 
-    const cacheKey = 'm_' + Utilities.base64EncodeWebSafe(url);
+    const cacheKey = cacheKeyFromUrl_('m_', url);
     const cached = cache.get(cacheKey);
-
     if (cached) {
-      try { ingestMarket_(out, JSON.parse(cached)); } catch (_) {}
+      try { Object.assign(out, JSON.parse(cached)); } catch (_) {}
       continue;
     }
 
-    reqs.push({ url, muteHttpExceptions: true });
-    meta.push({ url, cacheKey });
-  }
+    const txt = fetchTextWithRetry_(url, cfg);
+    if (!txt) continue;
 
-  if (reqs.length) {
-    const resps = UrlFetchApp.fetchAll(reqs);
-    for (let i = 0; i < resps.length; i++) {
-      const resp = resps[i];
-      const { url, cacheKey } = meta[i];
-      const code = resp.getResponseCode();
-
-      if (code !== 200) {
-        Logger.log('[market] code=%s url=%s body=%s', code, url, resp.getContentText().slice(0, 200));
-        continue;
-      }
-
-      const txt = resp.getContentText();
-      try {
-        const data = JSON.parse(txt);
-        cache.put(cacheKey, txt, cfg.cacheMarket);
-        ingestMarket_(out, data);
-      } catch (err) {
-        Logger.log('[market] json parse fail url=%s err=%s', url, err);
-      }
+    try {
+      const data = JSON.parse(txt);
+      const compact = extractMinMapFromMarketMulti_(data);
+      safeCachePut_(cache, cacheKey, JSON.stringify(compact), cfg.cacheMarket);
+      Object.assign(out, compact);
+    } catch (err) {
+      Logger.log('[market] parse fail url=%s err=%s', url, err);
     }
+
+    if (cfg.requestPauseMs > 0) Utilities.sleep(cfg.requestPauseMs);
   }
 
   return out;
 }
 
-function ingestMarket_(out, data) {
-  const itemId = String(data?.itemId ?? data?.itemID ?? '');
-  if (!itemId) return;
+function extractMinMapFromMarketMulti_(data) {
+  const out = {};
 
-  let hqMin = null;
-  let nqMin = null;
-
-  const listings = Array.isArray(data?.listings) ? data.listings : [];
-  for (const l of listings) {
-    const p = Number(l?.pricePerUnit);
-    if (!isFinite(p)) continue;
-
-    const isHQ = !!l?.hq;
-    if (isHQ) hqMin = (hqMin == null) ? p : Math.min(hqMin, p);
-    else      nqMin = (nqMin == null) ? p : Math.min(nqMin, p);
+  // single
+  if (data && (data.itemId != null || data.itemID != null) && Array.isArray(data.listings)) {
+    const id = String(data.itemId ?? data.itemID ?? '');
+    if (id) out[id] = extractMinFromListings_(data.listings);
+    return out;
   }
 
-  out[itemId] = { hqMin, nqMin };
+  const items = data?.items;
+  if (!items) return out;
+
+  const ingestOne = (it) => {
+    const id = String(it?.itemId ?? it?.itemID ?? '');
+    if (!id) return;
+    out[id] = extractMinFromListings_(it?.listings || []);
+  };
+
+  if (Array.isArray(items)) {
+    for (const it of items) ingestOne(it);
+  } else if (typeof items === 'object') {
+    for (const k of Object.keys(items)) ingestOne(items[k]);
+  }
+  return out;
+}
+
+function extractMinFromListings_(listings) {
+  let hqMin = null, nqMin = null;
+  for (const l of (Array.isArray(listings) ? listings : [])) {
+    const p = Number(l?.pricePerUnit);
+    if (!isFinite(p)) continue;
+    if (!!l?.hq) hqMin = (hqMin == null) ? p : Math.min(hqMin, p);
+    else nqMin = (nqMin == null) ? p : Math.min(nqMin, p);
+  }
+  return { hqMin, nqMin };
 }
 
 /***********************
- * 趨勢：天數依設定（預設 7 天），每天抽樣
+ * history fallback (latest sale) batch + compact cache
+ ***********************/
+function fetchLastSoldFromHistory_(scope, ids, cfg) {
+  const out = {};
+  if (!cfg.allowExternalFetch) return out;
+
+  const cache = CacheService.getDocumentCache();
+  const batchSize = Math.max(1, Math.min(100, cfg.historyBatchSize));
+  const chunks = chunkArray_(ids, batchSize);
+
+  const seconds = Math.max(1, cfg.historyFallbackHours) * 3600;
+
+  for (const batch of chunks) {
+    const url =
+      "https://universalis.app/api/v2/history/" +
+      encodeURIComponent(scope) + "/" +
+      batch.map(x => encodeURIComponent(String(x))).join(",") +
+      "?entriesWithin=" + seconds;
+
+    const cacheKey = cacheKeyFromUrl_('h_', url);
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      try { Object.assign(out, JSON.parse(cached)); } catch (_) {}
+      continue;
+    }
+
+    const txt = fetchTextWithRetry_(url, cfg);
+    if (!txt) continue;
+
+    try {
+      const data = JSON.parse(txt);
+      const compact = extractLastMapFromHistoryMulti_(data);
+      safeCachePut_(cache, cacheKey, JSON.stringify(compact), cfg.cacheHisFb);
+      Object.assign(out, compact);
+    } catch (err) {
+      Logger.log('[his-fb] parse fail url=%s err=%s', url, err);
+    }
+
+    if (cfg.requestPauseMs > 0) Utilities.sleep(cfg.requestPauseMs);
+  }
+
+  return out;
+}
+
+function extractLastMapFromHistoryMulti_(data) {
+  const out = {};
+
+  // single
+  if (data && (data.itemId != null || data.itemID != null)) {
+    const id = String(data.itemId ?? data.itemID ?? '');
+    const entries = data?.recentHistory || data?.entries || [];
+    if (id) out[id] = extractLastFromHistoryEntries_(entries);
+    return out;
+  }
+
+  const items = data?.items || data?.results;
+  if (!items) return out;
+
+  const ingestOne = (it) => {
+    const id = String(it?.itemId ?? it?.itemID ?? '');
+    if (!id) return;
+    const entries = it?.recentHistory || it?.entries || [];
+    out[id] = extractLastFromHistoryEntries_(entries);
+  };
+
+  if (Array.isArray(items)) {
+    for (const it of items) ingestOne(it);
+  } else if (typeof items === 'object') {
+    for (const k of Object.keys(items)) ingestOne(items[k]);
+  }
+
+  return out;
+}
+
+function extractLastFromHistoryEntries_(entries) {
+  let hqLast = null, hqTs = -1;
+  let nqLast = null, nqTs = -1;
+
+  const arr = Array.isArray(entries) ? entries : [];
+  for (const s of arr) {
+    let ts = s?.timestamp ?? s?.timestampMs ?? s?.time;
+    ts = Number(ts);
+    if (!isFinite(ts)) continue;
+    const tsMs = ts < 1e12 ? ts * 1000 : ts;
+
+    const price = Number(s?.pricePerUnit ?? s?.price);
+    if (!isFinite(price)) continue;
+
+    if (!!s?.hq) {
+      if (tsMs > hqTs) { hqTs = tsMs; hqLast = price; }
+    } else {
+      if (tsMs > nqTs) { nqTs = tsMs; nqLast = price; }
+    }
+  }
+
+  return { hqLast, nqLast };
+}
+
+/***********************
+ * Trend
  ***********************/
 function updateTrendData_(ss) {
   const cfg = getConfig_();
@@ -592,7 +956,9 @@ function updateTrendData_(ss) {
   const scope = normalizeScope_(front.getRange(WORLD_CELL).getDisplayValue());
   const itemName = normalizeName_(front.getRange(TARGET_CELL).getDisplayValue() || '');
 
+  // 沒有 target：清掉趨勢 + 清掉流動性
   if (!scope || !itemName) {
+    front.getRange(LIQ_CELL).clearContent();
     writeTrend_(ss, [], { scope, itemName, itemId: '' });
     return;
   }
@@ -600,13 +966,9 @@ function updateTrendData_(ss) {
   const nameToId = buildNameToIdMap_(mapSh);
   const itemId = String(nameToId[itemName] || '').trim();
 
-  if (!itemId) {
-    writeTrend_(ss, [], { scope, itemName, itemId: '' });
-    return;
-  }
-
-  if (!cfg.allowExternalFetch) {
-    writeTrend_(ss, [], { scope, itemName, itemId });
+  if (!itemId || !cfg.allowExternalFetch) {
+    front.getRange(LIQ_CELL).clearContent();
+    writeTrend_(ss, [], { scope, itemName, itemId: itemId || '' });
     return;
   }
 
@@ -616,10 +978,19 @@ function updateTrendData_(ss) {
     encodeURIComponent(itemId) +
     "?entriesWithin=" + seconds;
 
-  const data = fetchJsonWithRetry_(url, cfg.cacheHis, cfg.allowExternalFetch);
-  let hist = normalizeHistory_(data);
-  hist.sort((a, b) => a.timestampMs - b.timestampMs);
+  const data = fetchJsonWithRetry_(url, cfg.cacheHis, cfg);
 
+  // ✅ 先用「原始 history」算流動性（不要 downsample）
+  const rawHist = normalizeHistory_(data);
+  rawHist.sort((a, b) => a.timestampMs - b.timestampMs);
+
+  const liq = computeVelocityFromHistory_(rawHist, cfg.days);
+  // 沒資料就清，避免顯示錯誤星星
+  if (!rawHist.length) front.getRange(LIQ_CELL).clearContent();
+  else front.getRange(LIQ_CELL).setValue(liquidityStars_(liq.vel));
+
+  // ✅ 再拿 rawHist 去做 downsample & 寫趨勢表
+  let hist = rawHist;
   hist = downsampleHistoryByDay_(hist, cfg.maxTrendPerDay);
 
   if (hist.length > cfg.maxTrendRowsTotal) {
@@ -632,112 +1003,54 @@ function updateTrendData_(ss) {
   writeTrend_(ss, hist, { scope, itemName, itemId });
 }
 
-function downsampleHistoryByDay_(hist, perDayLimit) {
-  const tz = Session.getScriptTimeZone();
-  const buckets = new Map();
 
-  for (const r of hist) {
-    const dayKey = Utilities.formatDate(new Date(r.timestampMs), tz, 'yyyy-MM-dd');
-    if (!buckets.has(dayKey)) buckets.set(dayKey, []);
-    buckets.get(dayKey).push(r);
-  }
-
-  const out = [];
-  const keys = Array.from(buckets.keys()).sort();
-  for (const k of keys) {
-    const arr = buckets.get(k) || [];
-    if (arr.length <= perDayLimit) {
-      out.push(...arr);
-    } else {
-      const step = Math.ceil(arr.length / perDayLimit);
-      for (let i = 0; i < arr.length; i += step) out.push(arr[i]);
-    }
-  }
-  return out;
-}
-
-/***********************
- * mapping：idmappingtableTW A=名稱, B=ID
- ***********************/
-function buildNameToIdMap_(mapSh) {
-  const last = mapSh.getLastRow();
-  if (last < 1) return {};
-  const vals = mapSh.getRange(1, 1, last, 2).getDisplayValues(); // A:B
-  const map = {};
-  for (const [name, id] of vals) {
-    const n = normalizeName_(name);
-    const i = String(id || '').trim();
-    if (n && i && map[n] == null) map[n] = i;
-  }
-  return map;
-}
-
-function normalizeName_(s) {
-  return String(s || '')
-    .replace(/\u3000/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/***********************
- * 偵測 HQ checkbox 被改到哪些列
- ***********************/
-function detectHQEdits_(r1, r2, c1, c2) {
-  const out = [];
-  const rowLo = Math.max(LIST_START_ROW, r1);
-  const rowHi = Math.min(LIST_END_ROW, r2);
-  if (rowLo > rowHi) return out;
-
-  for (let bi = 0; bi < BLOCKS.length; bi++) {
-    const hqCol = BLOCKS[bi].hqCol;
-    if (hqCol < c1 || hqCol > c2) continue;
-    for (let r = rowLo; r <= rowHi; r++) out.push({ row: r, blockIndex: bi });
-  }
-  return out;
-}
-
-function rangeIntersectsA1_(sheet, r1, r2, c1, c2, a1) {
-  const rg = sheet.getRange(a1);
-  const rr = rg.getRow();
-  const cc = rg.getColumn();
-  return (rr >= r1 && rr <= r2 && cc >= c1 && cc <= c2);
-}
-
-/***********************
- * fetch json（含快取 + 退避重試）
- ***********************/
-function fetchJsonWithRetry_(url, cacheSeconds, allowExternalFetch) {
-  if (!allowExternalFetch) return {};
+function fetchJsonWithRetry_(url, cacheSeconds, cfg) {
+  if (!cfg || !cfg.allowExternalFetch) return {};
   const cache = CacheService.getDocumentCache();
-  const key = 'u_' + Utilities.base64EncodeWebSafe(url);
+  const key = cacheKeyFromUrl_('u_', url);
   const cached = cache.get(key);
-  if (cached) return JSON.parse(cached);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (_) {}
+  }
 
-  const waits = [400, 900, 1800];
+  const txt = fetchTextWithRetry_(url, cfg);
+  if (!txt) return {};
+  try {
+    const obj = JSON.parse(txt);
+    safeCachePut_(cache, key, JSON.stringify(obj), cacheSeconds);
+    return obj;
+  } catch (_) {
+    return {};
+  }
+}
+
+function fetchTextWithRetry_(url, cfg) {
+  if (!cfg.allowExternalFetch) return '';
+
+  const b = Math.max(50, Number(cfg.retryBaseMs || 300));
+  const waits = [b, b * 3, b * 6, b * 9].slice(0, Math.max(1, cfg.retryMaxAttempts || 4));
+
   for (let i = 0; i < waits.length; i++) {
-    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    const res = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      headers: { 'User-Agent': 'FFXIV-Price-Helper(GAS)' },
+    });
     const code = res.getResponseCode();
+    const body = res.getContentText();
 
-    if (code === 200) {
-      const data = JSON.parse(res.getContentText());
-      cache.put(key, JSON.stringify(data), cacheSeconds);
-      return data;
-    }
+    if (code === 200) return body;
 
-    if (code === 429 || (code >= 500 && code <= 599)) {
+    if (code === 429 || code === 504 || (code >= 500 && code <= 599)) {
       Utilities.sleep(waits[i]);
       continue;
     }
 
-    Logger.log('[fetch] code=%s url=%s body=%s', code, url, res.getContentText().slice(0, 200));
-    return {};
+    Logger.log('[fetch] code=%s url=%s body=%s', code, url, body.slice(0, 200));
+    return '';
   }
-  return {};
+  return '';
 }
 
-/***********************
- * history 解析 + 寫入趨勢表
- ***********************/
 function normalizeHistory_(data) {
   let hist =
     data?.recentHistory ||
@@ -760,6 +1073,29 @@ function normalizeHistory_(data) {
     const qty = Number(s?.quantity ?? 0);
     const hq = !!(s?.hq);
     out.push({ timestampMs: tsMs, pricePerUnit: price, quantity: qty, hq });
+  }
+  return out;
+}
+
+function downsampleHistoryByDay_(hist, perDayLimit) {
+  const tz = Session.getScriptTimeZone();
+  const buckets = new Map();
+
+  for (const r of hist) {
+    const dayKey = Utilities.formatDate(new Date(r.timestampMs), tz, 'yyyy-MM-dd');
+    if (!buckets.has(dayKey)) buckets.set(dayKey, []);
+    buckets.get(dayKey).push(r);
+  }
+
+  const out = [];
+  const keys = Array.from(buckets.keys()).sort();
+  for (const k of keys) {
+    const arr = buckets.get(k) || [];
+    if (arr.length <= perDayLimit) out.push(...arr);
+    else {
+      const step = Math.ceil(arr.length / perDayLimit);
+      for (let i = 0; i < arr.length; i += step) out.push(arr[i]);
+    }
   }
   return out;
 }
@@ -793,35 +1129,24 @@ function writeTrend_(ss, rows, meta) {
 }
 
 /***********************
- * DEBUG：直接用 D5 的品名測一筆
+ * utils: chunk, cache key, safe cache put
  ***********************/
-function debugOneRowD5() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig_();
-  const front = ss.getSheetByName(FRONT_SHEET_NAME);
-  const mapSh = ss.getSheetByName(MAP_SHEET_NAME);
-  if (!front || !mapSh) throw new Error('Missing sheets');
+function chunkArray_(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
-  const scopeRaw = front.getRange(WORLD_CELL).getDisplayValue();
-  const scope = normalizeScope_(scopeRaw);
+function cacheKeyFromUrl_(prefix, url) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, url, Utilities.Charset.UTF_8);
+  const hex = bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+  return prefix + hex;
+}
 
-  const nameToId = buildNameToIdMap_(mapSh);
-  const name = normalizeName_(front.getRange(5, 4).getDisplayValue()); // D5
-  const id = String(nameToId[name] || '').trim();
-
-  Logger.log('scopeRaw=%s scope=%s', scopeRaw, scope);
-  Logger.log('D5 name=%s => id=%s', name, id);
-
-  if (!scope) throw new Error('C1 scope empty');
-  if (!name) throw new Error('D5 name empty');
-  if (!id) throw new Error('No mapping for D5 name');
-
-  const r = fetchMinListingsFromMarket_(scope, [id], cfg)[id] || {};
-  Logger.log('RESULT id=%s hqMin=%s nqMin=%s', id, r.hqMin, r.nqMin);
-
-  SpreadsheetApp.getActive().toast(
-    `DEBUG D5: scope=${scope} id=${id} HQmin=${r.hqMin ?? '-'} NQmin=${r.nqMin ?? '-'}`,
-    'FFXIV',
-    8
-  );
+function safeCachePut_(cache, key, value, seconds) {
+  try {
+    // CacheService value 有大小上限，太大就不要硬塞
+    if (value && value.length > 90000) return;
+    cache.put(key, value, seconds);
+  } catch (_) {}
 }
